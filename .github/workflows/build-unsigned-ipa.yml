@@ -1,0 +1,269 @@
+# Build an UNSIGNED DSH.app / DSH-unsigned.ipa on GitHub's Apple-Silicon macOS runner.
+#
+# Why this exists: everettjf/dsh-ios needs a Mac with Xcode to build, and it ships
+# no prebuilt IPA. This workflow reproduces `make emulator && make rootfs` plus an
+# unsigned device build of DSH.app on a cloud runner, so no Mac is required locally.
+#
+# After the run, download the `DSH-unsigned-ipa` artifact and sign it on Windows
+# with Sideloadly / AltStore (free Apple ID is enough — the app declares no
+# entitlements an unsigned build carries, see the runbook).
+#
+# Provenance for every command below (kept honest on purpose):
+#   * runs-on: macos-15 + `brew install llvm lld ninja meson libarchive`
+#     -> copied from the vendored emulator's own CI: ish-arm64/.github/workflows/ci.yml:44-51
+#   * `xcodebuild ... -arch arm64 -sdk iphoneos CODE_SIGNING_ALLOWED=NO`
+#     -> same file, line 58
+#   * `ld.lld` is mandatory or the guest silently gets a stub VDSO
+#     -> ish-arm64/vdso/arm64/meson.build:44-49 and vdso/arm64/check-cc-arm64.sh
+#   * build/root.tar.gz is what the app bundles
+#     -> app/AppDSH.xcconfig:36 (DSH_ROOTFS_TARBALL) + scripts/build-rootfs.sh:OUT
+
+name: build-unsigned-ipa
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_id_prefix:
+        description: "Bundle ID prefix (change to your own, e.g. com.yourname)"
+        required: true
+        default: "com.example"
+      dsh_version:
+        description: "Pin a different @deepseek-ai/dsh inside the guest rootfs (blank = use rootfs/staging/package.json)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-unsigned-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # macos-14 and macos-15 are Apple Silicon. macos-13 is Intel and CANNOT run the
+    # iSH-ARM64 host CLI that scripts/build-rootfs.sh drives, so never switch to it.
+    runs-on: macos-15
+    timeout-minutes: 180
+
+    env:
+      DSH_BUNDLE_ID_PREFIX: ${{ inputs.bundle_id_prefix }}
+      DSH_VERSION: ${{ inputs.dsh_version }}
+
+    steps:
+      # ---------------------------------------------------------------- checkout
+      - uses: actions/checkout@v4
+
+      # ----------------------------------------------------------------- toolchain
+      - name: Select newest Xcode image
+        run: |
+          set -euo pipefail
+          echo "== Xcode images present =="
+          ls -d /Applications/Xcode*.app || true
+          NEWEST="$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+          echo "selecting: $NEWEST"
+          sudo xcode-select -s "$NEWEST"
+          xcode-select -p
+          xcodebuild -version
+
+      - name: Use Node 22 (host-side npm is required by build-rootfs.sh)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Homebrew dependencies
+        run: |
+          set -euo pipefail
+          brew install llvm lld ninja meson libarchive
+
+          # `-fuse-ld=lld` (vdso/arm64/meson.build:32) makes clang resolve `ld.lld`
+          # through PATH. `brew install lld` can be keg-only, and a missing ld.lld
+          # does NOT fail the build -- it silently produces a stub VDSO, which makes
+          # the app install but never boot the guest. Force it onto PATH.
+          if ! command -v ld.lld >/dev/null 2>&1; then
+            LLD_BIN="$(brew --prefix lld)/bin"
+            echo "ld.lld not on PATH -> adding $LLD_BIN"
+            echo "$LLD_BIN" >> "$GITHUB_PATH"
+            export PATH="$LLD_BIN:$PATH"
+          fi
+
+          echo "== versions =="
+          ld.lld --version | head -1
+          "$(brew --prefix llvm)/bin/clang" --version | head -2
+          meson --version
+          ninja --version
+          node -v
+          npm -v
+          python3 -V
+
+      # Gate #1: prove the aarch64 cross toolchain can actually LINK an ELF.
+      # This is exactly what meson runs internally, run early so a missing lld
+      # fails in seconds instead of after a 15-minute build.
+      - name: Gate 1 - aarch64 cross-linker can build a real VDSO
+        run: |
+          set -euo pipefail
+          LLVM_CLANG="$(brew --prefix llvm)/bin/clang"
+          test -x "$LLVM_CLANG" || { echo "Homebrew llvm clang missing at $LLVM_CLANG"; exit 1; }
+          # meson only looks at these absolute paths plus PATH `clang`
+          # (ish-arm64/vdso/arm64/meson.build:11)
+          bash ish-arm64/vdso/arm64/check-cc-arm64.sh "$LLVM_CLANG"
+
+      # ------------------------------------------------------------------ guest fs
+      - name: Build emulator CLI (host arm64) + fakefsify
+        run: make emulator
+
+      # Gate #2: the emulator build must have produced a REAL VDSO, not the stub.
+      # THIS IS THE ONE THAT MATTERS. Without lld, meson only warns
+      # (vdso/arm64/meson.build:47) and emits a 0-byte `touch` placeholder (:51),
+      # so the app compiles, installs, launches -- and the guest never boots.
+      - name: Gate 2 - libvdso.so.elf is a real ELF, not the empty stub
+        run: |
+          set -euo pipefail
+          BUILD=ish-arm64/build-arm64-release
+          VDSO="$(find "$BUILD" -name 'libvdso*.elf' | head -1)"
+
+          if [ -z "$VDSO" ]; then
+            # custom_target is normally built by default; if the project ever
+            # changes that, build it explicitly rather than reporting a false failure.
+            echo "libvdso not present after 'make emulator'; building the target explicitly"
+            ninja -C "$BUILD" vdso-arm64 2>/dev/null \
+              || ninja -C "$BUILD" vdso/arm64/libvdso.so.elf 2>/dev/null \
+              || true
+            VDSO="$(find "$BUILD" -name 'libvdso*.elf' | head -1)"
+          fi
+          test -n "$VDSO" || { echo "no libvdso*.elf produced anywhere under $BUILD"; exit 1; }
+
+          echo "== meson log evidence =="
+          if grep -q 'building a stub' "$BUILD/meson-logs/meson-log.txt" 2>/dev/null; then
+            echo "meson-log says: building a stub  <-- this is the silent-failure path"
+            grep -n -A2 -B2 'building a stub' "$BUILD/meson-logs/meson-log.txt" || true
+          else
+            echo "meson-log contains no 'building a stub' warning"
+          fi
+          ls -l "$VDSO"
+          SIZE="$(wc -c < "$VDSO" | tr -d ' ')"
+          echo "size=$SIZE"
+          test "$SIZE" -gt 1000 || {
+            echo "libvdso.so.elf is only ${SIZE}B -> this is the stub VDSO (touch placeholder)."
+            echo "The app would install but the guest would never boot. Fix lld and re-run."
+            exit 1
+          }
+          file "$VDSO"
+          file "$VDSO" | grep -qi 'elf' || { echo "not an ELF"; exit 1; }
+          test -x ish-arm64/build-arm64-release/tools/fakefsify
+          test -x ish-arm64/build-arm64-release/tools/unfakefsify
+
+      - name: Optionally re-pin the guest dsh version
+        if: ${{ inputs.dsh_version != '' }}
+        run: |
+          set -euo pipefail
+          echo "re-pinning guest @deepseek-ai/dsh -> $DSH_VERSION"
+          # Drop the lockfile so `npm ci` fails and build-rootfs.sh falls back to
+          # `npm install @deepseek-ai/dsh@$DSH_VERSION` (scripts/build-rootfs.sh:57-59).
+          rm -f rootfs/staging/package-lock.json
+          python3 - "$DSH_VERSION" <<'PY'
+          import json, sys, pathlib
+          p = pathlib.Path("rootfs/staging/package.json")
+          data = json.loads(p.read_text())
+          data["dependencies"]["@deepseek-ai/dsh"] = sys.argv[1]
+          p.write_text(json.dumps(data, indent=2) + "\n")
+          print(p.read_text())
+          PY
+
+      - name: Build guest rootfs (Alpine 3.21 + Node 22 + dsh) -> build/root.tar.gz
+        run: make rootfs
+
+      # Gate #3: the guest image must exist and be plausibly complete (~81 MB
+      # per README.md:98). A tiny tarball means an early guest-phase failure that
+      # `set -euo pipefail` could have swallowed behind `| sed`.
+      - name: Gate 3 - root.tar.gz exists and has the expected magnitude
+        run: |
+          set -euo pipefail
+          ls -l build/root.tar.gz build/root.tar.gz.sha256
+          SIZE="$(wc -c < build/root.tar.gz | tr -d ' ')"
+          echo "root.tar.gz = $SIZE bytes"
+          test "$SIZE" -gt 20000000 || {
+            echo "root.tar.gz is only ${SIZE}B; expected tens of MB. Guest phase failed."
+            exit 1
+          }
+          cat build/root.tar.gz.sha256
+
+      # ------------------------------------------------------------------- app
+      - name: Build DSH.app for device (unsigned)
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          xcodebuild \
+            -project DSH.xcodeproj \
+            -scheme DSH \
+            -configuration Release \
+            -sdk iphoneos \
+            -arch arm64 \
+            -derivedDataPath build/dd \
+            DSH_BUNDLE_ID_PREFIX="$DSH_BUNDLE_ID_PREFIX" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="" \
+            build 2>&1 | tee build/xcodebuild.log
+
+      - name: Gate 4 - locate the .app and prove the guest image is embedded
+        id: app
+        run: |
+          set -euo pipefail
+          APP="$(find build/dd/Build/Products -maxdepth 2 -name 'DSH.app' -type d | head -1)"
+          test -n "$APP" || { echo "DSH.app not found under build/dd/Build/Products"; find build/dd/Build/Products -maxdepth 2 || true; exit 1; }
+          echo "APP=$APP" >> "$GITHUB_OUTPUT"
+          echo "== bundle =="
+          ls -l "$APP"
+          test -x "$APP/DSH" || { echo "missing executable $APP/DSH"; exit 1; }
+          # 'Copy DSH Root' build phase must have embedded the guest image:
+          # DSH.xcodeproj -> shell phase, input $(DSH_ROOTFS_TARBALL)
+          test -f "$APP/root.tar.gz" || { echo "root.tar.gz missing from the app bundle"; exit 1; }
+          ls -l "$APP/root.tar.gz"
+          echo "== Info.plist =="
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist" || true
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist" || true
+          echo "== signature state (expect: not signed / no CodeResources) =="
+          ls -l "$APP/_CodeSignature" 2>/dev/null || echo "no _CodeSignature  (correct for an unsigned build)"
+          codesign -dv "$APP" 2>&1 | head -5 || true
+
+      - name: Package Payload/ -> DSH-unsigned.ipa
+        run: |
+          set -euo pipefail
+          APP="${{ steps.app.outputs.APP }}"
+          rm -rf build/ipa && mkdir -p build/ipa/Payload
+          cp -R "$APP" build/ipa/Payload/
+          # AppleDouble junk from the macOS filesystem must not enter the IPA.
+          find build/ipa -name '._*' -delete
+          ( cd build/ipa && zip -qry ../DSH-unsigned.ipa Payload )
+          ls -lh build/DSH-unsigned.ipa
+          echo "== IPA contents (sanity: Payload/DSH.app + root.tar.gz) =="
+          unzip -l build/DSH-unsigned.ipa | head -12
+          unzip -l build/DSH-unsigned.ipa | grep -c 'Payload/DSH.app/root.tar.gz'
+          shasum -a 256 build/DSH-unsigned.ipa | tee build/DSH-unsigned.ipa.sha256
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: DSH-unsigned-ipa
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            build/DSH-unsigned.ipa
+            build/DSH-unsigned.ipa.sha256
+            build/root.tar.gz.sha256
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            build/xcodebuild.log
+            ish-arm64/build-arm64-release/meson-logs/meson-log.txt
