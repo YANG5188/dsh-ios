@@ -170,6 +170,28 @@ jobs:
           print(p.read_text())
           PY
 
+      # The emulator's do_uname() copies the HOST nodename into a 65-byte field
+      # (ish-arm64/kernel/uname.c, UNAME_LENGTH=65 at kernel/calls.h:269). On a
+      # GitHub macOS runner that nodename overflows the field, and because clang
+      # lowers `strcpy` into `__strcpy_chk -> stpcpy` under _FORTIFY_SOURCE, the
+      # overflow becomes a hard SIGTRAP (__chk_fail_overflow) the first time the
+      # guest calls uname() -- inside `apk update`:
+      #
+      #   == Guest phase 1: packages
+      #   HOST CRASH: signal 5 / __chk_fail_overflow / stpcpy / sys_uname + 196
+      #
+      # uname.c is patched to copy with an explicit bound, so this step is purely
+      # so the next person sees the host identity instead of a mystery crash.
+      - name: Diagnostics - host identity vs the 65-byte uname field
+        run: |
+          set -uo pipefail
+          echo "field width: UNAME_LENGTH = $(grep -o 'UNAME_LENGTH [0-9]*' ish-arm64/kernel/calls.h)"
+          for probe in "hostname" "uname -n" "scutil --get HostName" "scutil --get LocalHostName" "scutil --get ComputerName"; do
+            value="$($probe 2>/dev/null || true)"
+            printf '  %-24s len=%-4s value=%s\n' "$probe" "${#value}" "$value"
+          done
+          echo "  patch check: $(grep -c 'copy_field' ish-arm64/kernel/uname.c) copy_field call sites (expect 6)"
+
       - name: Build guest rootfs (Alpine 3.21 + Node 22 + dsh) -> build/root.tar.gz
         run: make rootfs
 
