@@ -14,6 +14,29 @@
 const char *uname_version = "SUPER AWESOME";
 const char *uname_hostname_override = NULL;
 
+/*
+ * Every field below is char[UNAME_LENGTH] (65) and every source string is
+ * externally controlled: the host nodename, or __DATE__/__TIME__. A plain
+ * strcpy() into a 65-byte field is rewritten by clang into
+ * __strcpy_chk() -> stpcpy() whenever _FORTIFY_SOURCE is active, so when a
+ * source is too long the fortify check calls __chk_fail_overflow() and the
+ * whole host binary dies with SIGTRAP instead of truncating:
+ *
+ *   == Guest phase 1: packages
+ *   HOST CRASH: signal 5
+ *     __chk_fail_overflow + 24
+ *     stpcpy + 0
+ *     sys_uname + 196        <-- kernel/uname.c
+ *
+ * That is exactly what happens on a GitHub macOS runner, whose nodename is
+ * longer than 65 bytes: the guest crashes the moment anything calls uname(),
+ * i.e. inside `apk update`. Truncating is the correct behaviour here (the guest
+ * only ever sees a hostname), so copy with an explicit bound.
+ */
+static void copy_field(char *dst, size_t dst_size, const char *src) {
+    snprintf(dst, dst_size, "%s", src);
+}
+
 void do_uname(struct uname *uts) {
     struct utsname real_uname;
     uname(&real_uname);
@@ -22,16 +45,16 @@ void do_uname(struct uname *uts) {
         hostname = uname_hostname_override;
 
     memset(uts, 0, sizeof(struct uname));
-    strcpy(uts->system, "Linux");
-    strcpy(uts->hostname, hostname);
-    strcpy(uts->release, "4.20.69-ish");
+    copy_field(uts->system, sizeof(uts->system), "Linux");
+    copy_field(uts->hostname, sizeof(uts->hostname), hostname);
+    copy_field(uts->release, sizeof(uts->release), "4.20.69-ish");
     snprintf(uts->version, sizeof(uts->version), "%s %s %s", uname_version, __DATE__, __TIME__);
 #if defined(GUEST_ARM64)
-    strcpy(uts->arch, "aarch64");
+    copy_field(uts->arch, sizeof(uts->arch), "aarch64");
 #else
-    strcpy(uts->arch, "i686");
+    copy_field(uts->arch, sizeof(uts->arch), "i686");
 #endif
-    strcpy(uts->domain, "(none)");
+    copy_field(uts->domain, sizeof(uts->domain), "(none)");
 }
 
 dword_t sys_uname(addr_t uts_addr) {
